@@ -1,0 +1,384 @@
+# MVP Task Board
+
+## PREREQUISITE: Fix browser tool to use existing Chromium, not Google Chrome (DONE — PERMANENT FIX)
+
+### What happened
+- Hermes browser tool uses `agent-browser` CLI, which has `AGENT_BROWSER_EXECUTABLE_PATH` env var
+- `browser_tool.py` reads this env var from `os.environ` (line 3736) and passes it through to agent-browser (line 874)
+- `browser_tool.py` does NOT read `browser.executable_path` from config.yaml directly — it needs an env var
+- **Fix applied (2 code changes to Hermes core):**
+  1. `cli.py` line 659: added `"executable_path": "AGENT_BROWSER_EXECUTABLE_PATH"` to the `browser_env_mappings` dict. This bridges `browser.executable_path` from config.yaml → `AGENT_BROWSER_EXECUTABLE_PATH` in os.environ at startup.
+  2. `hermes_cli/config.py` line 276: added `"AGENT_BROWSER_EXECUTABLE_PATH"` to `_EXTRA_ENV_KEYS` so `.env` reload also recognizes it (fallback path).
+- **Config saved:** `hermes config set browser.executable_path` → Playwright Chromium path
+- **Path used:** `/Users/linas/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing` (open-source Chromium, already on machine from playwright install)
+- Google Chrome spyware (`chrome-150.0.7871.24`) deleted from `/Users/linas/.agent-browser/browsers/`
+- Tested after deletion — browser still works via Playwright Chromium
+- After Hermes restart, future sessions use the open-source Chromium automatically. No manual export needed.
+
+---
+
+## POC 1: Memory Graph + Retrieval (FOUNDATION)
+
+### 1.1 Choose infrastructure — DECIDED: FAISS + NetworkX
+- **DECISION: FAISS (vectors) + NetworkX (graph) + pickle (persistence)**
+  - LadybugDB benchmarked and REJECTED: vector search too slow past 10k nodes (4.4ms at 10k, linear scaling = 44ms at 100k). 5 min of runtime blows the 16-33ms tick budget.
+  - FAISS: 0.064ms at 1k, 0.368ms at 10k. 12-17x faster than LadybugDB. Eats numpy directly, no Cypher, no prepared statements.
+  - NetworkX: typed edges, multi-hop traversal, pickle persistence — all tested and working.
+  - Trade-off: two systems synced on shared ID (no ACID), manual pickle persistence. Fine for POC 1-3. Switch to HNSW/IVF index at 100k+ scale.
+  - Benchmark: research/benchmark_faiss_networkx.py
+  - Findings: research/faiss_networkx_validation.md
+
+### 1.1a DONE — LadybugDB vector search benchmarked and rejected
+- Results: 1.1ms at 1k, 4.4ms at 10k (IndexFlatIP, 768-dim, cosine). Linear scaling = too slow past 10k.
+- FAISS replacement: 0.064ms at 1k, 0.368ms at 10k. 12-17x faster.
+
+### 1.1b DONE — NetworkX graph traversal validated
+- Typed edges (ACTION, RESULT, CONTEXT): YES — done via edge "type" attribute
+- Multi-hop traversal (3 hops: state -> action -> result -> next_state): YES — tested
+- Persistence: YES — pickle save/reload verified, node attrs intact
+- Delete node with edge cleanup: YES — no dangling edges after deletion
+
+### 1.2 Define data structures
+- MemoryNode: state_vector (np.ndarray, projected dims), prediction_error (float), timestamp (unix), text_metadata (str or None), node_id
+- ActionNode: action_vector (np.ndarray), action_type (str), node_id
+- Edge types: ACTION (state→action), RESULT (state→next_state), CONTEXT (state→retrieved_state)
+- Serialization format for persistence (depends on infra choice from 1.1)
+
+### 1.3 Build storage layer
+- Add node (creates node, adds to graph, adds vector to index)
+- Add edge between nodes (ACTION, RESULT, CONTEXT)
+- Persist to disk (survives restarts)
+- Load from disk on startup (rebuild index + graph)
+- CRUD: create, read by ID, delete node (also remove from vector index)
+
+### 1.4 Build retrieval layer
+- Query vector index with a state vector → returns K nearest node IDs + distances
+- Look up those node IDs in graph → get their edges
+- For each retrieved node: get ACTION edge → what action was taken; get RESULT edge → what happened next
+- Return structured result: list of (retrieved_state_vector, action_taken, result_state, prediction_error, timestamp, text_metadata)
+
+### 1.5 Build confidence computation
+- Input: retrieval results (distances, count, node data)
+- Confidence = f(count of similar nodes found, average distance to them, consistency of their prediction errors)
+- Simple formula, not a neural net. Example:
+  - 0 similar → confidence 0.0 (very low)
+  - 1-3 similar, high distance → confidence 0.2 (low)
+  - 5+ similar, low distance, consistent errors → confidence 0.8+ (high)
+- Output: single float 0.0 to 1.0
+
+### 1.6 Build novelty computation
+- Input: same retrieval results
+- Few/no similar nodes found → high novelty (1.0)
+- Many close similar nodes → low novelty (0.0)
+- Output: single float 0.0 to 1.0
+
+### 1.7 Build learning progress computation
+- Input: retrieved nodes with similar states, sorted by timestamp
+- Look at their prediction errors over time (they have timestamps)
+- Compute slope: are errors trending down (learning) or flat (not learning)?
+- Simple linear regression on prediction_error vs timestamp for the cluster
+- Output: single float (positive = learning, negative = getting worse, ~0 = flat)
+
+### 1.8 Test with fake data
+- Generate 500 fake state vectors (correct dim), some clustered intentionally
+- Store as nodes with fake actions, fake prediction errors, timestamps
+- Create edges: state→action→result chains
+- Test 1: Query with vector near a cluster → does retrieval return that cluster?
+- Test 2: Query with vector in empty space → does retrieval return nothing/distant?
+- Test 3: Does confidence compute correctly (high for cluster, low for empty)?
+- Test 4: Does novelty compute correctly (low for cluster, high for empty)?
+- Test 5: Follow edges → do you get valid action→result chains?
+- Test 6: Persist to disk, reload, does everything restore correctly?
+- If any test fails, fix before moving on. This is the foundation.
+
+### 1.9 Test learning progress with fake time series
+- Generate 50 nodes with same state cluster but decreasing prediction errors over time
+- Query that state → check learning progress comes out positive
+- Generate 50 nodes with flat prediction errors → check learning progress ~0
+- This validates the "am I actually learning" signal works
+
+
+## POC 2: Signal Encoding Pipeline
+
+### 2.1 Set up screen capture
+- Use `mss` library (fast screen capture, cross-platform)
+- Capture at 30fps (or whatever the tick rate will be)
+- Each frame → PIL Image → ready for CLIP encoding
+
+### 2.2 Set up CLIP encoder
+- Install: `pip install open_clip_torch`
+- Load a small CLIP model (ViT-B/32 for POC — fastest, decent quality)
+- Function: `encode_image(pil_image) → np.ndarray(768)`
+- Test: encode a screenshot, check output shape is (768,)
+
+### 2.3 Set up audio capture + Whisper
+- Use `sounddevice` for mic capture
+- Capture 1-second chunks at 16kHz
+- Use Whisper (tiny model for POC speed) to encode audio
+- Function: `encode_audio(audio_chunk) → np.ndarray`
+- Test: record 1 second, encode, check output shape
+
+### 2.4 Set up mouse/keyboard state capture
+- Use `pynput` to read current mouse X/Y and pressed keys
+- Encode: raw values in a small vector (mouse_x, mouse_y, one-hot for common keys)
+- Function: `encode_input_state(mouse_pos, key_states) → np.ndarray`
+- Test: move mouse, capture state, encode, check shape
+
+### 2.5 RESEARCH: Projection layer training data generation
+- LLaVA trains on (image, caption) pairs. What's the equivalent for each peripheral?
+- For vision (CLIP on screenshots): what's the "target representation"? LLaVA uses text captions. Do we need text descriptions of every screenshot? Or can we use CLIP's own embedding space as the target (since CLIP already maps images to a shared space)?
+- For audio (Whisper): what's the target? Whisper already produces embeddings. Can we just use Whisper's embedding directly without projection?
+- For input state (mouse/keyboard): raw values, small dimension. Is projection even needed or can we just pad to 256?
+- KEY QUESTION: what exactly are the "pairs" for each modality, and can we avoid training entirely for some by using encoder spaces directly?
+- This blocks 2.6 and 2.7 — can't build unified state vector without knowing projection approach
+
+### 2.5a RESEARCH: Can CLIP embeddings go directly into LadybugDB without projection?
+- CLIP already maps images to a 768-dim semantically meaningful space
+- LadybugDB can index vectors of any dimension
+- If all peripherals use their native encoder dimensions (768 for CLIP, variable for Whisper, small for input), retrieval still works — LadybugDB indexes whatever you give it
+- The "unified 256-dim" was for the world model input, not for the memory store
+- QUESTION: can the memory store use native encoder dimensions while the world model input uses projected dimensions? Two different representations for two different purposes?
+- This would let POC 1-3 work without ANY projection training, and defer projection to POC 4 (world model integration)
+
+### 2.6 Build unified state vector
+- Concatenate all projected peripheral vectors
+- [vision_256][audio_256][input_state_256]
+- Total for POC: 768 dims (3 peripherals)
+- OR: if 2.5a shows native dimensions work for memory, use native dims (768+variable+small) for POC 1-3 and defer projection to POC 4
+- Function: `build_state_vector(screenshot, audio, input) → np.ndarray`
+- Test: capture everything, build vector, check shape
+
+### 2.7 Feed real data into POC 1 memory
+- Take unified state vector from 2.6
+- Feed into memory graph from POC 1 as real node
+- Repeat 100 times (100 ticks of real computer state)
+- Query with new real state vector → does retrieval return similar real states?
+- This proves: real sensors → real encoding → real storage → real retrieval works
+
+
+## POC 2.5: Run Plan2Explore Vanilla
+
+### 2.5.1 Install SheepRL
+- `pip install sheeprl`
+- Install MuJoCo or Crafter environment support
+- Test: does `sheeprl exp=plan2explore env=gym env.id=CartPole-v1` run?
+
+### 2.5.2 Run on a visual environment
+- Run Plan2Explore on Crafter or MuJoCo (visual observations)
+- Let it train for a few hours
+- Observe: does the agent explore driven by curiosity? Does it seek novel states?
+- This validates: the DRIVE works in practice. Curiosity-driven exploration is real.
+
+### 2.5.3 Extract internal state vectors
+- While Plan2Explore runs, hook into the model to extract its latent state vectors
+- This is reading a layer output, not modifying the model
+- Store these vectors in the POC 1 memory graph
+- Now you have: a curiosity-driven agent's experiences being logged in YOUR memory system
+- NOTE: need to find WHERE in SheepRL code to extract latent state — check `dreamer_v3.py` train() function around line 146 where `latent_states` is computed
+
+
+## POC 3: Retrieval-Augmented Decision Loop
+
+### 3.0 RESEARCH: Choose environment and define exact state/action space
+- Grid world vs desktop vs text-based — MUST DECIDE before coding
+- Grid world (simplest):
+  - State: [agent_x, agent_y, food_x, food_y, battery] = 5 numbers
+  - Actions: up/down/left/right (4 discrete)
+  - Environment: 10x10 grid, food restores battery, battery drops 1/step
+  - Pro: controllable, easy to debug, can verify learning visually
+  - Con: doesn't use real sensors from POC 2
+- Desktop (real sensors):
+  - State: CLIP(screen) + Whisper(mic) + mouse/keyboard state (from POC 2)
+  - Actions: mouse_move(x,y), click(left/right), key_press(key)
+  - Environment: whatever's on screen
+  - Pro: uses real multi-peripheral signal, real consequences
+  - Con: action space is complex, hard to verify learning, could do damage
+- RECOMMENDATION: start with grid world for POC 3, use desktop as environment for later iteration
+- Need to define: how is state encoded to 256 dims for grid world? (small MLP or just pad?)
+
+### 3.1 Build the decision loop
+- Tick: encode current state → query memory → get confidence + retrieved actions
+- If confidence HIGH: repeat the action that worked best in similar past states
+- If confidence LOW: format state + retrieved memories as text → send to LLM → parse response to action
+- Execute action in environment → observe result → compute prediction error
+- Store new experience in memory graph (state + action + result + error)
+
+### 3.2 Add LLM fallback
+- When confidence is very low (no similar memories):
+  - Format: "I'm in state [X]. I have no similar memories. Available actions: [up, down, left, right]. What should I do?"
+  - Send to a small local LLM (via ollama or llama.cpp)
+  - Parse response to extract an action
+  - Execute, observe, store
+- Next time similar state encountered: memory has it, no LLM needed
+
+### 3.3 Add boredom/novelty to drive exploration
+- When novelty is low (lots of similar memories, nothing new happening):
+  - System prefers moving to unexplored areas
+  - Track via vector density — areas with few stored nodes = unexplored
+- When novelty is high: engage, explore, learn
+
+### 3.4 Test the full loop
+- Run agent in grid world for 1000 ticks
+- Does it explore? Does it find food? Does it learn to find food faster over time?
+- Does confidence increase as it gains experience?
+- Does LLM fallback trigger when in unfamiliar territory?
+- Does it stop needing LLM for situations it's encountered before?
+- Does boredom push it to explore new areas after mastering current ones?
+- This is the first real proof of concept: sense → remember → decide → act → learn
+
+### 3.5 RESEARCH: How does POC 3 code connect to POC 4?
+- POC 3 uses a simple decision loop (memory retrieval → repeat action or ask LLM)
+- POC 4 replaces that with DreamerV3 (world model → simulate → plan → act)
+- What code carries over? Memory graph (POC 1), encoding pipeline (POC 2), confidence computation (POC 1.5)
+- What gets replaced? The decision logic (simple repeat/ask → world model planning)
+- What needs a bridge? The confidence value from retrieval needs to gate DreamerV3's planning depth
+- Document the exact interface: what does POC 4 consume from POC 1-3, and what does it replace?
+
+
+## POC 4: DreamerV3 + Memory Integration
+
+### 4.1 SheepRL DreamerV3 code investigation (DONE — verified against actual source)
+- SheepRL cloned and inspected at `/tmp/sheeprl_inspect/`
+- **Actual files:** `agent.py` (RSSM, encoders, decoders, actor, critic), `dreamer_v3.py` (main algo, train loop, player), `loss.py` (reconstruction_loss), configs are hydra YAML
+- **MLPEncoder** (`agent.py:100`): takes a dict of observations, concatenates values, runs MLP. Input dim = sum of all observation dims. Adding a new key to the dict = adding to input dim.
+- **Key injection point** (`dreamer_v3.py:113`): `embedded_obs = world_model.encoder(batch_obs)`. Add a "memory" key to `batch_obs` dict with retrieved memory vectors and the encoder handles it.
+- **Untouched:** RSSM, decoder, actor, critic, loss function, imagination loop (all verified by reading code)
+- **Needs changing:** encoder input dim (trivial), replay buffer to store memories (medium), player loop to retrieve+inject memories (medium), config YAML (trivial)
+- **VERDICT: Tractable with LLM assistance. No ML expert needed.** It's plumbing, not research. Hard part is replay buffer sequence alignment.
+
+### 4.2 RESEARCH: How does SheepRL's replay buffer work internally?
+- Read `sheeprl/data/buffers.py` — specifically `SequentialReplayBuffer`
+- How does it store data? Dict of numpy arrays? Tensors? What keys exist?
+- How does sequence sampling work? It samples sequences of length `per_rank_sequence_length` (default 15)
+- How would you add a new key ("memories") to stored entries?
+- Does the buffer have a fixed schema or is it flexible?
+- Can memories be stored at collection time (static) or must they be retrieved at sampling time (dynamic)?
+- Static is easier: store the retrieved memories alongside the observation when collected
+- Dynamic is harder but more accurate: retrieve memories during training based on current state
+- RECOMMENDATION: start with static (store at collection time), upgrade to dynamic later if needed
+
+### 4.3 Implement the modification
+- Modify MLPEncoder to accept memory as additional observation key
+- Modify replay buffer to store retrieved memories per timestep (based on 4.2 findings)
+- Modify player loop to retrieve memories and inject into observation dict
+- Add config parameters to `sheeprl/configs/algo/dreamer_v3.yaml`: memory_dim, num_memories, position_tag_dim
+- Test: train modified DreamerV3 on simple env, verify it learns
+- Compare: with/without memory — does memory help on tasks where past experience matters?
+
+### 4.4 Connect confidence gating to DreamerV3's planning
+- High confidence → DreamerV3 does single forward pass, act on it (skip full planning)
+- Low confidence → DreamerV3 does full multi-trajectory simulation (existing behavior)
+- Very low confidence → escalate to language pathway
+- This means modifying the action selection logic in `dreamer_v3.py` (the actor's imagination loop at line 234), not the world model itself
+- The confidence value from retrieval gates HOW DreamerV3 plans, not whether it plans
+
+### 4.5 Test the integrated system
+- Run the modified DreamerV3 + memory in a simple environment
+- Does the agent use memory to inform decisions? (compare behavior with/without memory)
+- Does confidence gating work? (fast path on familiar, planning on novel)
+- Does the world model's predictions improve faster with memory than without?
+- This is the proof: memory-augmented world model outperforms vanilla on complex tasks
+
+
+## POC 5: Language Pathway
+
+### 5.1 RESEARCH: Projection training data — what exactly are the pairs?
+- LLaVA approach: train a linear layer mapping state vectors → LLM embedding space
+- LLaVA trains on (image, caption) pairs — 400k of them
+- For grid world states: easy to generate text descriptions ("Agent at (4,7), battery 73%, food at (8,2)")
+- For desktop screenshots: harder. What text describes a screenshot in a way that trains a useful projection?
+  - "Desktop showing code editor on left, browser on right, terminal at bottom" — too high-level
+  - Object detection labels ("window, menu bar, cursor at (340, 200)") — more structured but needs a detector
+  - Maybe use CLIP's own text encoding as the target — CLIP already maps images and text to the same space
+- KEY QUESTION: for grid world, text descriptions are trivial. For desktop, need to define what "ground truth text" means
+- For POC 5, start with grid world where text descriptions are easy. Defer desktop language to later.
+- How many pairs needed? LLaVA used 400k. State vectors are simpler than images. Maybe 10k-50k sufficient?
+- Is this tractable to train solo? Linear layer training is standard PyTorch. The data generation is the question, not the training.
+
+### 5.2 RESEARCH: Can we skip projection entirely for POC 5?
+- Instead of training a projection (state vector → LLM embedding space), format state as TEXT directly
+- Grid world: "I'm at position (4,7), my battery is 73%, food is at (8,2)" — just send this string to the LLM
+- Desktop: "Screenshot shows [CLIP caption or object labels], cursor at (340, 200)"
+- This is cruder than a trained projection but requires ZERO training data
+- The LLM reasons about the text and suggests actions in text
+- Question: does this work well enough to demonstrate the principle, or is the projection necessary for meaningful reasoning?
+- Try text-first approach. If LLM reasoning is useful, that's the POC. If not, THEN train projection.
+
+### 5.3 Train the signal → LLM projection (if 5.2 text approach is insufficient)
+- Generate training data: run system in simulation, for each state, generate text description automatically
+  - Grid world: trivial — format state variables as text
+  - Desktop: need object detection or CLIP captioning first
+- Encode text through the LLM's tokenizer → get LLM embedding
+- Pair with the state vector from that moment
+- Repeat for thousands of experiences
+- Train linear projection: state_vector → LLM embedding space
+- Test: project a state vector, feed to LLM, does the LLM produce a relevant response?
+
+### 5.4 Build internal monologue loop
+- Every N ticks: world model state → projection (or text format) → LLM → text output
+- Store text as metadata on current memory node
+- Encode text through text encoder → vector → inject into language_input peripheral slot
+- Next tick: world model sees the language input as part of the signal
+- The system is now narrating its own experience to itself continuously
+
+### 5.5 Build LLM → action translation
+- RT-2 approach: fine-tune LLM to output discretized action tokens
+- OR: text parsing approach (simpler for POC) — LLM outputs "recommended_action: right" and you parse it
+- Generate training data: (state description, correct action) pairs from successful experiences
+- For POC: text parsing is sufficient. Fine-tuning for production later.
+- Test: LLM outputs valid action when given a state description
+
+### 5.6 Test the language pathway
+- Does internal monologue produce coherent narratives about the system's state?
+- Does the LLM fallback (very low confidence) actually help solve problems?
+- After language reasoning succeeds for a novel situation, does the system stop needing it (memory takes over)?
+- Does the self-model emerge? (query memory for action history, LLM summarizes tendencies)
+
+### 5.7 Demonstrate self-model emergence
+- After 5000+ ticks with language pathway active:
+- Query memory graph for agent's own action history
+- Use LLM to summarize: "Based on these experiences, describe this agent's tendencies"
+- The summary IS the self-model — emerging from memory + language, not a separate module
+- Show that early beliefs can be examined and updated when evidence contradicts them
+
+
+## INFRASTRUCTURE DECISIONS LOG
+
+### Decided
+- FAISS (vectors) + NetworkX (graph) + pickle (persistence) — benchmarked and validated (research/benchmark_faiss_networkx.py, research/faiss_networkx_validation.md)
+- SheepRL for DreamerV3 / Plan2Explore
+- CLIP (open_clip_torch, ViT-B/32) for vision encoding
+- Whisper (tiny model) for audio encoding
+- pynput for mouse/keyboard state
+- Small local LLM via ollama or llama.cpp
+- Screen capture via `mss`
+- Audio capture via `sounddevice`
+- Projection layers: train properly (LLaVA-style), NOT PCA/truncation
+- DreamerV3 memory injection: via encoder (add memory key to observation dict), NOT via RSSM internals
+- Replay buffer memory storage: STATIC (store at collection time, not dynamic retrieval) — alignment is automatic, zero buffer changes needed (research/sheeprl_replay_buffer.md)
+- POC 1 skeleton code: models, storage ABC, retrieval, 38 tests passing (src/memory/)
+- LadybugDB: REJECTED — too slow for vector search at scale
+
+### Resolved
+- DreamerV3 modification is tractable with LLM assistance, no ML expert needed (verified against actual SheepRL source code)
+- POC 4-5 are achievable solo — the "need an ML person" claim was overly cautious
+- The modification is plumbing (encoder input dim, replay buffer, player loop), not ML research
+- TODO 1.1a: DONE — LadybugDB benchmarked (too slow), FAISS validated (12-17x faster)
+- TODO 1.1b: DONE — NetworkX graph traversal + persistence validated
+- TODO 4.2: DONE — SheepRL replay buffer is flexible dict, adding "memories" key is trivial, static storage recommended
+
+### Open research tasks
+- 2.5: Projection training data generation — what are the pairs for each modality?
+- 2.5a: Can native encoder dimensions work for memory storage (defer projection to POC 4)?
+- 3.0: Choose environment (grid world vs desktop) and define exact state/action space
+- 3.5: How does POC 3 code connect to POC 4 (what carries over, what gets replaced)?
+- 5.1: What exactly are the text descriptions for training the signal→LLM projection?
+- 5.2: Can text-formatting approach skip projection entirely for POC?
+
+### Not needed for POC
+- Time-series graph structure (RESULT edges + timestamps handle temporal chains)
+- Physical robot hardware (computer sensors work for POC)
+- 7 peripherals (start with 3: screen, mic, input state)
+- Fine-tuning LLM for action tokens (text parsing works for POC, fine-tune later)
+- Dynamic memory retrieval during training (static storage at collection time first)
+- Multi-peripheral projection training (if native encoder dims work for memory, defer to POC 4)

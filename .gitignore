@@ -1,0 +1,13 @@
+.venv/
+.venv-sheeprl/
+sheeprl_logs/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.DS_Store
+*.log
+tmp/
+benchmarks/
+research/p2e/overnight_videos/
+logs/
